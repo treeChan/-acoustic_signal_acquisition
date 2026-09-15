@@ -35,6 +35,7 @@ def artifact_payload(version: str, platform_key: str, item: dict[str, object]) -
         "url": item["url"],
         "size": item["size"],
         "sha256": item["sha256"],
+        "system_signature": item["system_signature"],
     }
     return b"acoustic-vector-update-artifact-v1\0" + canonical_json(descriptor)
 
@@ -69,6 +70,26 @@ def parse_artifact(value: str) -> tuple[str, Path]:
     return platform_key, Path(path)
 
 
+def parse_system_signature(value: str) -> tuple[str, str]:
+    try:
+        platform_key, signature_kind = value.split("=", 1)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "system signature must be PLATFORM=KIND"
+        ) from exc
+    allowed = {
+        "macos-arm64": {"apple-developer-id", "unsigned"},
+        "windows-x64": {"windows-authenticode", "unsigned"},
+    }
+    if platform_key not in allowed:
+        raise argparse.ArgumentTypeError(f"unsupported platform: {platform_key}")
+    if signature_kind not in allowed[platform_key]:
+        raise argparse.ArgumentTypeError(
+            f"unsupported system signature for {platform_key}: {signature_kind}"
+        )
+    return platform_key, signature_kind
+
+
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -83,12 +104,24 @@ def main() -> int:
     parser.add_argument("--notes", required=True, type=Path)
     parser.add_argument("--base-download-url", required=True)
     parser.add_argument("--artifact", action="append", type=parse_artifact, required=True)
+    parser.add_argument(
+        "--system-signature",
+        action="append",
+        type=parse_system_signature,
+        required=True,
+        help="Signed OS trust metadata as PLATFORM=KIND",
+    )
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--metadata-dir", type=Path)
     args = parser.parse_args()
 
     version = read_version()
     key = load_private_key(args.private_key)
+    system_signatures = dict(args.system_signature)
+    if len(system_signatures) != len(args.system_signature):
+        raise SystemExit("Duplicate system signature platform")
+    if set(system_signatures) != {"macos-arm64", "windows-x64"}:
+        raise SystemExit("System signature status is required for both platforms")
     platforms: dict[str, dict[str, object]] = {}
     for platform_key, path in args.artifact:
         if platform_key in platforms:
@@ -100,6 +133,7 @@ def main() -> int:
             "size": path.stat().st_size,
             "sha256": sha256(path),
             "signature": "",
+            "system_signature": system_signatures[platform_key],
         }
         item["signature"] = base64.b64encode(
             key.sign(artifact_payload(version, platform_key, item))

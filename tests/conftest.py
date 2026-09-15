@@ -34,6 +34,7 @@ def make_signed_manifest(
     platforms: tuple[str, ...] = ("macos-arm64", "windows-x64"),
     sha256_override: str | None = None,
     artifact_signature_override: str | None = None,
+    system_signature: str = "unsigned",
 ) -> dict[str, Any]:
     digest = sha256_override or hashlib.sha256(artifact_data).hexdigest()
     platform_items: dict[str, dict[str, Any]] = {}
@@ -43,6 +44,7 @@ def make_signed_manifest(
             "size": len(artifact_data),
             "sha256": digest,
             "signature": "",
+            "system_signature": system_signature,
         }
         item["signature"] = artifact_signature_override or base64.b64encode(
             private_key.sign(artifact_signature_payload(version, platform_key, item))

@@ -14,11 +14,11 @@
 4. 在解析并采用任何清单值前，使用内置 Ed25519 公钥验证 `manifest_signature`。
 5. `packaging.version.Version` 比较当前版本和清单版本。正式与预览渠道不交叉。
 6. 下载在后台线程中流式写入系统临时目录 `acoustic-update-*/*.part`，显示字节数、总大小、速度和 ETA。取消、错误或验证失败会删除整个临时目录。
-7. 下载完成后依次检查实际大小、SHA-256，以及覆盖版本、平台、URL、大小和哈希的 Ed25519 安装包描述签名。通过后才把 `.part` 原子改名。
+7. 下载完成后依次检查实际大小、SHA-256，以及覆盖版本、平台、URL、大小、哈希和 `system_signature` 的 Ed25519 安装包描述签名。通过后才把 `.part` 原子改名。
 8. 如果采集线程仍在运行，主窗口要求用户选择“安全停止并更新”。采集线程停止 USB、关闭/flush HDF5 与 WAV、等待 PCM 转换线程、写完 JSON 与 manifest，最后发出 `finished`。只有该信号无关闭错误时才继续。
 9. 主程序启动独立 `AcousticUpdater` 后退出。外部助手等待父进程消失，并再次计算 SHA-256。
-10. macOS 助手安全解压 ZIP、拒绝路径或符号链接逃逸、校验 bundle id，并在暂存前后执行 `codesign --verify --deep --strict` 与 `spctl --assess`。随后在同一安装目录内进行备份、原子替换和失败回滚，再重启应用。
-11. Windows 助手在主程序退出后运行已签名的 Inno Setup。固定 `AppId` 使升级继承已有安装位置；安装成功后由安装器重启应用。
+10. macOS 助手安全解压 ZIP、拒绝路径或符号链接逃逸并校验 bundle id。清单标记 `apple-developer-id` 时，暂存前后必须通过 `codesign --verify --deep --strict` 与 `spctl --assess`；明确标记 `unsigned` 时不会冒充系统签名，但 Ed25519、SHA-256、bundle id、原子替换和回滚仍全部执行。
+11. Windows 助手在主程序退出后运行 Inno Setup。清单标记 `windows-authenticode` 时先用系统工具复核 Authenticode；明确标记 `unsigned` 时显示风险提醒后允许内部测试安装。固定 `AppId` 使升级继承已有安装位置；安装成功后由安装器重启应用。
 
 macOS 更新状态写入 `~/Library/Caches/AcousticVectorAcquisition/updater-status.json`；Windows 写入 `%LOCALAPPDATA%\AcousticVectorAcquisition\updater-status.json`。状态中不记录 token、私钥、代理用户名/密码或带查询串的 URL。
 
@@ -27,11 +27,13 @@ macOS 更新状态写入 `~/Library/Caches/AcousticVectorAcquisition/updater-sta
 发布脚本使用 UTF-8 JSON，`sort_keys=True`、紧凑分隔符 `(',', ':')`、禁止 NaN。两个域分离负载如下：
 
 - 清单：ASCII `acoustic-vector-update-manifest-v1`、一个 NUL 字节、去掉 `manifest_signature` 后的稳定序列化 JSON。这个签名同时覆盖两个安装包的 URL、大小、哈希和各自签名。
-- 安装包描述：ASCII `acoustic-vector-update-artifact-v1`、一个 NUL 字节、稳定序列化的 `version`、`platform`、`url`、`size`、`sha256`。
+- 安装包描述：ASCII `acoustic-vector-update-artifact-v1`、一个 NUL 字节、稳定序列化的 `version`、`platform`、`url`、`size`、`sha256`、`system_signature`。
 
 `scripts/make_update_manifest.py` 计算文件大小与 SHA-256、生成每个平台的 `.sha256` 和 `.sig`，最后生成带 `manifest_signature` 的 `update.json`。私钥只从临时文件读取；CI 临时文件来自 GitHub Actions Secret `UPDATE_ED25519_PRIVATE_KEY`。
 
 `updater/public_key.pem` 已配置为本项目的发布公钥。匹配的私钥保存在仓库之外，不得提交、复制到安装包或写入日志；CI 只通过 GitHub Actions Secret 注入。不要为了处理密钥错误而关闭签名验证。
+
+`system_signature` 只接受平台对应的 `apple-developer-id`、`windows-authenticode` 或 `unsigned`，并同时受清单签名和安装包描述签名保护。Ed25519 证明候选包来自本项目发布密钥且内容未被替换；Apple/Windows 系统签名证明操作系统层面的发布者身份。两者用途独立，不互相冒充。
 
 ## 清单地址与渠道
 
@@ -54,7 +56,7 @@ QT_QPA_PLATFORM=offscreen python3 -m pytest -q
 python3 -m compileall -q acoustic_acquisition.py acoustic_gui.py updater scripts tests
 ```
 
-测试中的 Ed25519 密钥每次临时生成且不落盘。本地 HTTP 服务器覆盖正常更新、无更新、302、404、超时、下载中断、取消、错误哈希、错误签名、缺少平台和代理变量。安装计划测试显式指定临时状态路径并调用 `test_mode`，不覆盖真实 `.app`、Windows 安装或任何记录目录。
+测试中的 Ed25519 密钥每次临时生成且不落盘。本地 HTTP 服务器覆盖正常更新、无更新、302、404、超时、下载中断、取消、错误哈希、错误签名、缺少平台和代理变量。安装计划测试显式指定临时状态路径并调用 `test_mode`；macOS unsigned 覆盖测试只操作 pytest 临时目录中的伪 `.app`，并逐个确认 HDF5、WAV、JSON、manifest 和用户配置未改变。
 
 ## 本地 macOS 构建
 
@@ -66,21 +68,39 @@ ACOUSTIC_HELPER_PATH="$PWD/helper-dist/AcousticUpdater" python3 -m PyInstaller -
 QT_QPA_PLATFORM=offscreen dist/AcousticVectorAcquisition.app/Contents/MacOS/AcousticVectorAcquisition --smoke-test
 ```
 
-本地包没有发布证书时只能验证启动与内容结构，不能当成正式更新包。正式工作流要求 Developer ID 签名、公证和 stapling，然后才生成 ZIP。
+本地无 Developer ID 时可用于个人/实验室内部测试，但必须标记为 unsigned。首次手动下载运行时，macOS 可能阻止打开；确认来源与 SHA-256 后，可在 Finder 中右键应用并选择“打开”。不要移除 Gatekeeper、不要使用自签名证书冒充 Developer ID，也不要把 unsigned 包描述为已公证。
 
 ## GitHub Actions Secrets
 
 必须配置：
 
 - `UPDATE_ED25519_PRIVATE_KEY`：与客户端公钥匹配的 Ed25519 PKCS#8 PEM；只存 Secret。
+
+macOS 系统签名为可选能力。以下六项必须全部配置或全部留空；全部留空时生成 `*-macos-arm64-unsigned.zip`：
+
 - `MACOS_CERTIFICATE_P12_BASE64`：Developer ID Application 证书及私钥的 P12 Base64。
 - `MACOS_CERTIFICATE_PASSWORD`：P12 密码。
 - `APPLE_SIGNING_IDENTITY`：例如 `Developer ID Application: ... (TEAMID)`。
 - `APPLE_ID`、`APPLE_APP_SPECIFIC_PASSWORD`、`APPLE_TEAM_ID`：Apple 公证凭据。
+
+Windows 系统签名为可选能力。以下两项必须全部配置或全部留空；全部留空时生成 `*-windows-x64-unsigned-setup.exe`：
+
 - `WINDOWS_CERTIFICATE_PFX_BASE64`：Windows Authenticode 证书及私钥的 PFX Base64。
 - `WINDOWS_CERTIFICATE_PASSWORD`：PFX 密码。
 
-内置 `GITHUB_TOKEN` 由 Actions 提供，不写入源码。工作流构建和测试完成后才创建 Release；最后通过 GitHub API 验证 Release 状态、`update.json`、两平台安装包、`.sha256`、`.sig`、清单版本和所有下载 URL。任一步不满足都会失败。
+`scripts/detect_signing_mode.py` 对每个平台采取全有或全无策略；部分配置会使构建失败，不会悄悄降级。不得配置自签名证书冒充 Developer ID/Authenticode。
+
+内置 `GITHUB_TOKEN` 由 Actions 提供，不写入源码。工作流构建和测试完成后才创建 Release；最后通过 GitHub API 验证 Release 状态、`update.json`、两平台安装包、`.sha256`、`.sig`、清单版本、所有下载 URL、远端文件大小、SHA-256 和 Ed25519 安装包签名。任一步不满足都会失败。
+
+## 无 tag 的候选包测试
+
+从 `main` 手动运行 `Build and publish verified update`（`workflow_dispatch`）时，工作流会完成三平台测试、macOS/Windows 打包、清单签名和本地候选包验证，然后把完整候选包保存为 14 天 Actions artifact。这个路径不会创建或修改任何 tag/Release，也没有 `contents: write` 权限。
+
+```bash
+gh workflow run release.yml --ref main
+```
+
+当前未配置 Apple/Windows 证书时，候选包会明确标记为 unsigned。客户端网络、下载、重定向、代理、验签链路由本地 HTTP 集成测试覆盖；实际公开 URL 只在 preview 或正式 Release 创建后进行发布后端到端验证。
 
 ## 人工发布前检查
 
@@ -88,4 +108,5 @@ QT_QPA_PLATFORM=offscreen dist/AcousticVectorAcquisition.app/Contents/MacOS/Acou
 - 在一台非采集用测试 Mac 上验证下载、退出、替换、重启及无写权限提示。
 - 在干净 Windows x64 虚拟机验证首次安装、原地升级、UAC、进程退出与重启。
 - 在两平台各进行一次“录制中更新”，确认最终 HDF5/WAV/JSON/manifest 可读且样本数一致。
-- 确认 macOS `codesign`、`spctl`、notarization/staple 和 Windows Authenticode 均有效。
+- 若发布 signed 包，确认 macOS `codesign`、`spctl`、notarization/staple 和 Windows Authenticode 均有效。
+- 若发布 unsigned 包，确认文件名、更新对话框、Release notes 分别显示 macOS 右键“打开”和 Windows SmartScreen/“未知发布者”提醒。

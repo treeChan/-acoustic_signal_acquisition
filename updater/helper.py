@@ -136,7 +136,28 @@ def _verify_macos_signature(app_path: Path) -> None:
             raise RuntimeError(f"macOS 系统签名验证失败：{Path(command[0]).name}")
 
 
-def _install_macos(package: Path, target: Path, relaunch: bool) -> None:
+def _verify_windows_signature(package: Path) -> None:
+    environment = os.environ.copy()
+    environment["ACOUSTIC_UPDATE_PACKAGE"] = str(package)
+    command = (
+        "$signature = Get-AuthenticodeSignature -LiteralPath $env:ACOUSTIC_UPDATE_PACKAGE; "
+        "if ($signature.Status -ne 'Valid') { exit 1 }"
+    )
+    completed = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if completed.returncode:
+        raise RuntimeError("Windows Authenticode 系统签名验证失败。")
+
+
+def _install_macos(
+    package: Path, target: Path, relaunch: bool, system_signature: str
+) -> None:
     if target.suffix != ".app" or not target.exists():
         raise RuntimeError("目标 macOS 应用不存在或不是 .app。")
     if _bundle_identifier(target) != BUNDLE_ID:
@@ -149,7 +170,8 @@ def _install_macos(package: Path, target: Path, relaunch: bool) -> None:
     try:
         _safe_extract(package, extract_root)
         source_app = _find_app(extract_root)
-        _verify_macos_signature(source_app)
+        if system_signature == "apple-developer-id":
+            _verify_macos_signature(source_app)
         copied = subprocess.run(
             ["/usr/bin/ditto", str(source_app), str(staged_target)],
             stdin=subprocess.DEVNULL,
@@ -159,7 +181,8 @@ def _install_macos(package: Path, target: Path, relaunch: bool) -> None:
         )
         if copied.returncode:
             raise RuntimeError("无法把更新应用暂存到安装目录。")
-        _verify_macos_signature(staged_target)
+        if system_signature == "apple-developer-id":
+            _verify_macos_signature(staged_target)
         os.replace(target, backup)
         try:
             os.replace(staged_target, target)
@@ -180,7 +203,9 @@ def _install_macos(package: Path, target: Path, relaunch: bool) -> None:
         shutil.rmtree(staged_target, ignore_errors=True)
 
 
-def _install_windows(package: Path, relaunch: bool) -> None:
+def _install_windows(package: Path, relaunch: bool, system_signature: str) -> None:
+    if system_signature == "windows-authenticode":
+        _verify_windows_signature(package)
     arguments = [
         str(package),
         "/VERYSILENT",
@@ -216,6 +241,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target", required=True, type=Path)
     parser.add_argument("--parent-pid", required=True, type=int)
     parser.add_argument("--sha256", required=True)
+    parser.add_argument(
+        "--system-signature",
+        required=True,
+        choices=("apple-developer-id", "windows-authenticode", "unsigned"),
+    )
     parser.add_argument("--status-file", required=True, type=Path)
     parser.add_argument("--relaunch", action="store_true")
     parser.add_argument("--test-mode", action="store_true")
@@ -236,11 +266,20 @@ def main() -> int:
             raise RuntimeError("更新安装包不存在。")
         if _sha256(args.package).lower() != args.sha256.lower():
             raise RuntimeError("外部更新助手复核 SHA-256 失败。")
-        _write_status(args.status_file, "installing", "正在安装更新。")
+        expected_signatures = {
+            "macos-arm64": {"apple-developer-id", "unsigned"},
+            "windows-x64": {"windows-authenticode", "unsigned"},
+        }
+        if args.system_signature not in expected_signatures[args.platform]:
+            raise RuntimeError("更新包的系统签名状态与当前平台不匹配。")
+        signature_note = "（unsigned 测试版）" if args.system_signature == "unsigned" else ""
+        _write_status(args.status_file, "installing", f"正在安装更新{signature_note}。")
         if args.platform == "macos-arm64":
-            _install_macos(args.package, args.target, args.relaunch)
+            _install_macos(
+                args.package, args.target, args.relaunch, args.system_signature
+            )
         else:
-            _install_windows(args.package, args.relaunch)
+            _install_windows(args.package, args.relaunch, args.system_signature)
         _write_status(args.status_file, "installed", "更新安装程序已成功启动。")
         return 0
     except Exception as exc:

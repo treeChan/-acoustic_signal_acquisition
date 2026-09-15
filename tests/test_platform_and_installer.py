@@ -29,6 +29,7 @@ def test_install_plan_test_mode_never_overwrites_app(tmp_path: Path) -> None:
         package,
         digest,
         platform_key="macos-arm64",
+        system_signature="unsigned",
         executable=executable,
         parent_pid=12345,
         status_file=tmp_path / "updater-status.json",
@@ -36,3 +37,5 @@ def test_install_plan_test_mode_never_overwrites_app(tmp_path: Path) -> None:
     launch_install_plan(plan, test_mode=True)
     assert executable.read_bytes() == b"original-app"
     assert package.exists()
+    assert "--system-signature" in plan.command
+    assert "unsigned" in plan.command

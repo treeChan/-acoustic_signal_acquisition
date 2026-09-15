@@ -14,7 +14,16 @@ macOS 的 `CFBundleShortVersionString` 与 `CFBundleVersion` 只能保存点分�
 
 ## 正式发布
 
-当前首次正式发布版本为 `0.1.0`。确认所有 Secrets 已配置、公钥已提交、`main` CI 通过后，准确命令为：
+当前首次正式发布版本为 `0.1.0`。在创建正式 tag 前，先用无 tag 的候选构建验证当前提交：
+
+```bash
+gh workflow run release.yml --ref main
+gh run list --workflow release.yml --limit 1
+```
+
+候选构建只上传 Actions artifact，不创建 Release。`UPDATE_ED25519_PRIVATE_KEY` 必须配置；Apple/Windows 系统签名 Secrets 可全部留空并生成明确标记的 unsigned 测试包，也可按 `docs/updater.md` 成组配置。不要只配置一部分。
+
+候选包完成测试并获得明确发布确认后，准确命令为：
 
 ```bash
 cd /Users/chenshu/acoustic_signal_acquisition
@@ -27,7 +36,7 @@ git tag -a v0.1.0 -m "Acoustic Vector Acquisition 0.1.0"
 git push origin v0.1.0
 ```
 
-最后一条命令触发正式构建。工作流只接受 tag 与 `VERSION` 完全一致的提交，并拒绝覆盖已存在的正式 Release。正式 Release 由工作流创建为非 draft、非 prerelease，并设置 latest。
+最后一条命令触发正式构建。工作流只接受 tag 与 `VERSION` 完全一致的提交，并拒绝覆盖已存在的正式 Release。正式 Release 由工作流创建为非 draft、非 prerelease，并设置 latest。unsigned 安装包允许公开下载，但 Release notes 和客户端必须保留平台风险提醒。
 
 不要在未经明确确认时执行这些提交、推送、打 tag 或正式发布命令。
 

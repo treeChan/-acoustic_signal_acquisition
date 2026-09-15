@@ -94,6 +94,37 @@ def test_release_and_client_canonical_signature_payloads_match(signing_key) -> N
     )
 
 
+def test_system_signature_is_covered_by_artifact_signature(signing_key, public_key_pem) -> None:
+    raw = make_signed_manifest(signing_key, "https://example.com/update.zip", b"payload")
+    raw["platforms"]["macos-arm64"]["system_signature"] = "apple-developer-id"
+    raw["manifest_signature"] = base64.b64encode(
+        signing_key.sign(manifest_signature_payload(raw))
+    ).decode("ascii")
+    verify_manifest_signature(raw, public_key_pem)
+    manifest = parse_manifest(raw)
+    with pytest.raises(UpdateError) as failure:
+        verify_artifact_signature(
+            manifest.version,
+            "macos-arm64",
+            manifest.platforms["macos-arm64"],
+            public_key_pem,
+        )
+    assert failure.value.code == "signature"
+
+
+def test_platform_rejects_wrong_system_signature(signing_key) -> None:
+    raw = make_signed_manifest(
+        signing_key,
+        "https://example.com/update.zip",
+        b"payload",
+        platforms=("macos-arm64",),
+        system_signature="windows-authenticode",
+    )
+    with pytest.raises(UpdateError) as failure:
+        parse_manifest(raw)
+    assert failure.value.code == "manifest_schema"
+
+
 def test_committed_release_public_key_is_valid_ed25519() -> None:
     raw = (ROOT / "updater" / "public_key.pem").read_bytes()
     # Loading happens in every signature verification call. This explicit

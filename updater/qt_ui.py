@@ -20,6 +20,32 @@ from .installer import build_install_plan, launch_install_plan
 LOGGER = logging.getLogger("acoustic.updater")
 
 
+def system_signature_label(system_signature: str) -> str:
+    return {
+        "apple-developer-id": "Apple Developer ID（已签名并公证）",
+        "windows-authenticode": "Windows Authenticode（已签名）",
+        "unsigned": "unsigned（无操作系统发行者签名）",
+    }.get(system_signature, "未知")
+
+
+def unsigned_platform_warning(platform_key: str, system_signature: str) -> str:
+    if system_signature != "unsigned":
+        return ""
+    if platform_key == "macos-arm64":
+        return (
+            "此测试版没有 Apple Developer ID 签名或公证。首次手动运行时 macOS "
+            "可能阻止打开；请确认来自本项目后，在 Finder 中右键应用并选择“打开”。"
+            "程序仍会强制验证 Ed25519 和 SHA-256。"
+        )
+    if platform_key == "windows-x64":
+        return (
+            "此测试版没有 Windows Authenticode 签名。安装时可能显示 Microsoft Defender "
+            "SmartScreen 或“未知发布者”提示；请仅在确认来自本项目后继续。"
+            "程序仍会强制验证 Ed25519 和 SHA-256。"
+        )
+    return "此测试版没有操作系统发行者签名，请仅在确认来源后安装。"
+
+
 def embedded_public_key() -> bytes:
     candidates: list[Path] = [Path(__file__).with_name("public_key.pem")]
     frozen_root = getattr(sys, "_MEIPASS", None)
@@ -121,10 +147,25 @@ class UpdateAvailableDialog(QtWidgets.QDialog):
         heading.setStyleSheet("font-size: 20px; font-weight: 700;")
         layout.addWidget(heading)
         versions = QtWidgets.QLabel(
-            f"当前版本：{check.current_version}\n最新版本：{check.latest_version}"
+            f"当前版本：{check.current_version}\n"
+            f"最新版本：{check.latest_version}\n"
+            f"系统签名：{system_signature_label(check.artifact.system_signature)}\n"
+            "完整性验证：Ed25519 + SHA-256（强制）"
         )
         versions.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         layout.addWidget(versions)
+        warning_text = unsigned_platform_warning(
+            check.platform_key, check.artifact.system_signature
+        )
+        if warning_text:
+            warning = QtWidgets.QLabel("⚠ " + warning_text)
+            warning.setObjectName("unsignedUpdateWarning")
+            warning.setWordWrap(True)
+            warning.setStyleSheet(
+                "background: #fff3cd; color: #664d03; border: 1px solid #ffecb5; "
+                "border-radius: 5px; padding: 10px;"
+            )
+            layout.addWidget(warning)
         layout.addWidget(QtWidgets.QLabel("更新说明："))
         notes = SafeNotesBrowser()
         notes.setOpenExternalLinks(False)
@@ -312,6 +353,7 @@ class UpdateManager(QtCore.QObject):
                 result.path,
                 check.artifact.sha256,
                 platform_key=check.platform_key,
+                system_signature=check.artifact.system_signature,
             )
             launch_install_plan(plan)
         except UpdateError as exc:

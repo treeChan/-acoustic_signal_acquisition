@@ -42,6 +42,7 @@ def artifact_signature_payload(
             "url": artifact.url,
             "size": artifact.size,
             "sha256": artifact.sha256.lower(),
+            "system_signature": artifact.system_signature,
         }
     else:
         descriptor = {
@@ -50,6 +51,7 @@ def artifact_signature_payload(
             "url": artifact["url"],
             "size": artifact["size"],
             "sha256": str(artifact["sha256"]).lower(),
+            "system_signature": artifact["system_signature"],
         }
     return ARTIFACT_DOMAIN.encode("ascii") + b"\0" + canonical_json(descriptor)
 

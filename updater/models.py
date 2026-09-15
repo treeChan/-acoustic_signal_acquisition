@@ -26,6 +26,11 @@ class UpdateArtifact:
     size: int
     sha256: str
     signature: str
+    system_signature: str
+
+    @property
+    def is_system_signed(self) -> bool:
+        return self.system_signature != "unsigned"
 
 
 @dataclass(frozen=True)
@@ -132,7 +137,7 @@ def parse_manifest(raw: dict[str, Any], *, allow_localhost: bool = False) -> Upd
     for platform_key, value in platform_values.items():
         if not isinstance(value, dict):
             raise UpdateError("manifest_schema", f"平台 {platform_key} 的配置必须是对象。")
-        artifact_fields = {"url", "size", "sha256", "signature"}
+        artifact_fields = {"url", "size", "sha256", "signature", "system_signature"}
         if set(value) != artifact_fields:
             missing_artifact = sorted(artifact_fields - value.keys())
             extra_artifact = sorted(value.keys() - artifact_fields)
@@ -153,7 +158,20 @@ def parse_manifest(raw: dict[str, Any], *, allow_localhost: bool = False) -> Upd
         if not isinstance(sha256, str) or not SHA256_RE.fullmatch(sha256):
             raise UpdateError("manifest_schema", f"平台 {platform_key} 的 sha256 无效。")
         signature = _valid_signature(value["signature"], f"platforms.{platform_key}.signature")
-        platforms[platform_key] = UpdateArtifact(url, size, sha256.lower(), signature)
+        system_signature = value["system_signature"]
+        allowed_system_signatures = {
+            "macos-arm64": {"apple-developer-id", "unsigned"},
+            "windows-x64": {"windows-authenticode", "unsigned"},
+        }[platform_key]
+        if not isinstance(system_signature, str) or system_signature not in allowed_system_signatures:
+            allowed = ", ".join(sorted(allowed_system_signatures))
+            raise UpdateError(
+                "manifest_schema",
+                f"平台 {platform_key} 的 system_signature 必须是：{allowed}。",
+            )
+        platforms[platform_key] = UpdateArtifact(
+            url, size, sha256.lower(), signature, system_signature
+        )
 
     manifest_signature = _valid_signature(raw["manifest_signature"], "manifest_signature")
     return UpdateManifest(

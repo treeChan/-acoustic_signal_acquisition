@@ -1,4 +1,4 @@
-name: Build and publish signed update
+name: Build and publish verified update
 
 on:
   push:
@@ -23,10 +23,10 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       numeric_version: ${{ steps.version.outputs.numeric_version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: python -m pip install packaging
@@ -35,6 +35,7 @@ jobs:
         shell: bash
         run: python scripts/sync_version.py --github-output "$GITHUB_OUTPUT"
       - name: Require the matching release tag
+        if: github.event_name == 'push'
         shell: bash
         env:
           EXPECTED_TAG: ${{ steps.version.outputs.tag }}
@@ -49,10 +50,10 @@ jobs:
         os: [ubuntu-latest, macos-14, windows-2022]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -68,14 +69,15 @@ jobs:
     env:
       ACOUSTIC_VERSION: ${{ needs.metadata.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
-      - name: Require release secrets
+      - id: signing_mode
+        name: Select Developer ID or unsigned mode
         shell: bash
         env:
           MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
@@ -84,10 +86,7 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          for name in MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
-            test -n "${!name}" || { echo "Missing required secret: $name"; exit 1; }
-          done
+        run: python scripts/detect_signing_mode.py --platform macos --github-output "$GITHUB_OUTPUT"
       - name: Install build dependencies
         run: python -m pip install -r requirements-dev.txt
       - name: Build external updater and application
@@ -97,6 +96,7 @@ jobs:
           export ACOUSTIC_HELPER_PATH="$PWD/helper-dist/AcousticUpdater"
           python -m PyInstaller --noconfirm --clean --distpath dist --workpath build/app packaging/acoustic_gui.spec
       - name: Import Apple signing certificate
+        if: steps.signing_mode.outputs.enabled == 'true'
         shell: bash
         env:
           MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
@@ -112,6 +112,7 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security list-keychain -d user -s "$KEYCHAIN_PATH"
       - name: Sign, notarize and staple
+        if: steps.signing_mode.outputs.enabled == 'true'
         shell: bash
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -129,12 +130,14 @@ jobs:
           spctl --assess --type execute --verbose=2 "$APP_PATH"
       - name: Pack and smoke test
         shell: bash
+        env:
+          SIGNATURE_SUFFIX: ${{ steps.signing_mode.outputs.filename_suffix }}
         run: |
           mkdir -p release-assets
           QT_QPA_PLATFORM=offscreen dist/AcousticVectorAcquisition.app/Contents/MacOS/AcousticVectorAcquisition --smoke-test
           PLIST_VERSION="$(defaults read "$PWD/dist/AcousticVectorAcquisition.app/Contents/Info" AcousticFullVersion)"
           test "$PLIST_VERSION" = "$ACOUSTIC_VERSION"
-          ditto -c -k --sequesterRsrc --keepParent dist/AcousticVectorAcquisition.app "release-assets/AcousticVectorAcquisition-${ACOUSTIC_VERSION}-macos-arm64.zip"
+          ditto -c -k --sequesterRsrc --keepParent dist/AcousticVectorAcquisition.app "release-assets/AcousticVectorAcquisition-${ACOUSTIC_VERSION}-macos-arm64${SIGNATURE_SUFFIX}.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: macos-arm64-release
@@ -148,22 +151,20 @@ jobs:
       ACOUSTIC_VERSION: ${{ needs.metadata.outputs.version }}
       ACOUSTIC_NUMERIC_VERSION: ${{ needs.metadata.outputs.numeric_version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
-      - name: Require release secrets
+      - id: signing_mode
+        name: Select Authenticode or unsigned mode
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-        run: |
-          @('WINDOWS_CERTIFICATE_PFX_BASE64','WINDOWS_CERTIFICATE_PASSWORD') | ForEach-Object {
-            if ([string]::IsNullOrWhiteSpace((Get-Item "env:$_").Value)) { throw "Missing required secret: $_" }
-          }
+        run: python scripts/detect_signing_mode.py --platform windows --github-output "$env:GITHUB_OUTPUT"
       - name: Install build dependencies
         shell: pwsh
         run: |
@@ -178,6 +179,7 @@ jobs:
           $env:ACOUSTIC_WINDOWS_VERSION_FILE = (Resolve-Path "build\version_info.txt")
           python -m PyInstaller --noconfirm --clean --distpath dist --workpath build/app packaging/acoustic_gui.spec
       - name: Authenticode-sign application files
+        if: steps.signing_mode.outputs.enabled == 'true'
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
@@ -192,6 +194,8 @@ jobs:
           }
       - name: Smoke test and build installer
         shell: pwsh
+        env:
+          ACOUSTIC_WINDOWS_SIGNATURE_SUFFIX: ${{ steps.signing_mode.outputs.filename_suffix }}
         run: |
           $process = Start-Process -FilePath "dist\AcousticVectorAcquisition\AcousticVectorAcquisition.exe" -ArgumentList "--smoke-test" -PassThru
           if (-not $process.WaitForExit(15000)) { $process.Kill(); throw "Packaged GUI smoke test timed out" }
@@ -200,6 +204,7 @@ jobs:
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer\windows\AcousticVectorAcquisition.iss
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
       - name: Sign installer
+        if: steps.signing_mode.outputs.enabled == 'true'
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
@@ -216,20 +221,17 @@ jobs:
           path: release-assets/*
           if-no-files-found: error
 
-  publish-and-verify:
+  assemble-release:
     needs: [metadata, build-macos-arm64, build-windows-x64]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     env:
       VERSION: ${{ needs.metadata.outputs.version }}
-      CHANNEL: ${{ needs.metadata.outputs.channel }}
       TAG: ${{ needs.metadata.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: python -m pip install cryptography packaging requests
@@ -245,18 +247,67 @@ jobs:
         run: |
           python -c "import os,pathlib; pathlib.Path(os.environ['RUNNER_TEMP'],'release-key').write_text(os.environ['RELEASE_PRIVATE_KEY'],encoding='utf-8')"
           python scripts/verify_release_key.py --private-key "$RUNNER_TEMP/release-key" --public-key updater/public_key.pem
-          MAC_ASSET="release-assets/AcousticVectorAcquisition-${VERSION}-macos-arm64.zip"
-          WIN_ASSET="release-assets/AcousticVectorAcquisition-${VERSION}-windows-x64-setup.exe"
-          test -f "$MAC_ASSET"
-          test -f "$WIN_ASSET"
+          shopt -s nullglob
+          MAC_ASSETS=(release-assets/AcousticVectorAcquisition-*-macos-arm64*.zip)
+          WIN_ASSETS=(release-assets/AcousticVectorAcquisition-*-windows-x64*-setup.exe)
+          test "${#MAC_ASSETS[@]}" -eq 1
+          test "${#WIN_ASSETS[@]}" -eq 1
+          MAC_ASSET="${MAC_ASSETS[0]}"
+          WIN_ASSET="${WIN_ASSETS[0]}"
+          MAC_SYSTEM_SIGNATURE=apple-developer-id
+          WIN_SYSTEM_SIGNATURE=windows-authenticode
+          [[ "$MAC_ASSET" == *-unsigned.zip ]] && MAC_SYSTEM_SIGNATURE=unsigned
+          [[ "$WIN_ASSET" == *-unsigned-setup.exe ]] && WIN_SYSTEM_SIGNATURE=unsigned
           python scripts/make_update_manifest.py \
             --private-key "$RUNNER_TEMP/release-key" \
             --notes docs/release-notes.md \
             --base-download-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}" \
             --artifact "macos-arm64=${MAC_ASSET}" \
             --artifact "windows-x64=${WIN_ASSET}" \
+            --system-signature "macos-arm64=${MAC_SYSTEM_SIGNATURE}" \
+            --system-signature "windows-x64=${WIN_SYSTEM_SIGNATURE}" \
             --metadata-dir release-assets \
             --output release-assets/update.json
+          python scripts/validate_update_bundle.py --asset-dir release-assets --expected-version "$VERSION"
+      - name: Upload testable release candidate without creating a tag
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: AcousticVectorAcquisition-${{ env.VERSION }}-release-candidate
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Pass verified bundle to the publishing job
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-release-bundle
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-and-verify:
+    if: github.event_name == 'push'
+    needs: [metadata, assemble-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      CHANNEL: ${{ needs.metadata.outputs.channel }}
+      TAG: ${{ needs.metadata.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install cryptography packaging requests
+      - uses: actions/download-artifact@v4
+        with:
+          name: signed-release-bundle
+          path: release-assets
       - name: Publish GitHub Release with every required asset
         shell: bash
         env:

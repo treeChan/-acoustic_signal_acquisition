@@ -8,7 +8,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt5 import QtCore, QtWidgets
 
 from updater.errors import UpdateError
-from updater.qt_ui import UpdateManager, safe_markdown
+from updater.qt_ui import (
+    UpdateManager,
+    safe_markdown,
+    system_signature_label,
+    unsigned_platform_warning,
+)
 
 
 def test_release_notes_remove_html_links_and_remote_images() -> None:
@@ -20,6 +25,16 @@ def test_release_notes_remove_html_links_and_remote_images() -> None:
     assert "https://evil.test" not in rendered
     assert "链接" in rendered
     assert "[图片：像素]" in rendered
+
+
+def test_unsigned_platform_warnings_are_explicit() -> None:
+    assert "右键" in unsigned_platform_warning("macos-arm64", "unsigned")
+    assert "Apple Developer ID" in unsigned_platform_warning("macos-arm64", "unsigned")
+    assert "SmartScreen" in unsigned_platform_warning("windows-x64", "unsigned")
+    assert "未知发布者" in unsigned_platform_warning("windows-x64", "unsigned")
+    assert unsigned_platform_warning("macos-arm64", "apple-developer-id") == ""
+    assert "unsigned" in system_signature_label("unsigned")
+    assert "Apple Developer ID" in system_signature_label("apple-developer-id")
 
 
 def test_update_check_does_not_block_qt_event_loop(monkeypatch) -> None:

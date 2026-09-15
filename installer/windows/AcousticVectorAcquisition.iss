@@ -3,6 +3,7 @@
 #define MyAppVersion GetEnv("ACOUSTIC_VERSION")
 #define MyNumericVersion GetEnv("ACOUSTIC_NUMERIC_VERSION")
 #define MyBuildDir GetEnv("ACOUSTIC_WINDOWS_DIST")
+#define MySignatureSuffix GetEnv("ACOUSTIC_WINDOWS_SIGNATURE_SUFFIX")
 
 [Setup]
 AppId={{5A05F40A-62B7-49CC-9272-CE8CFFCE89F2}
@@ -14,6 +15,7 @@ VersionInfoDescription={#MyAppName}
 VersionInfoProductName={#MyAppName}
 VersionInfoProductVersion={#MyAppVersion}
 DefaultDirName={autopf}\AcousticVectorAcquisition
+UsePreviousAppDir=yes
 DisableProgramGroupPage=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -21,7 +23,7 @@ PrivilegesRequired=admin
 CloseApplications=yes
 RestartApplications=yes
 OutputDir=..\..\release-assets
-OutputBaseFilename=AcousticVectorAcquisition-{#MyAppVersion}-windows-x64-setup
+OutputBaseFilename=AcousticVectorAcquisition-{#MyAppVersion}-windows-x64{#MySignatureSuffix}-setup
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern

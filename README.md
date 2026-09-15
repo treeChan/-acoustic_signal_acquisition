@@ -34,9 +34,11 @@ bash run_gui_macos.command
 
 “帮助 → 检查更新…”可手动检查，程序启动 5 秒后也会在后台静默检查。正式版只读取正式渠道，预览版只读取 `preview` 渠道。发现新版本后会显示当前/最新版本与经过安全处理的 Markdown 更新说明；下载窗口显示进度、大小、速度、预计剩余时间并可取消。
 
-客户端只有在更新清单 Ed25519 签名、安装包 SHA-256 和安装包描述签名全部通过后才会进入安装。若正在显示、采集、录制或转换 WAV，程序会要求先安全停止；HDF5、WAV、同名 JSON 与 `manifest.jsonl` 全部关闭后，才启动独立更新助手。安装目录与记录目录相互独立，更新逻辑不会遍历、覆盖或删除 `~/Documents/AcousticVectorRecords` 或用户选择的其他数据目录。
+客户端只有在更新清单 Ed25519 签名、安装包 SHA-256 和安装包描述签名全部通过后才会进入安装；这些完整性检查在 signed 与 unsigned 包中都强制执行。清单还以签名字段记录系统签名状态，客户端不会根据文件名猜测。unsigned macOS 测试版会提示首次运行可能需要在 Finder 中右键“打开”，unsigned Windows 测试版会提示可能出现 SmartScreen 或“未知发布者”。不得把 Ed25519 更新签名表述为 Apple Developer ID 或 Windows Authenticode。
 
-源码中的 `updater/public_key.pem` 是客户端更新信任根；匹配的私钥绝不能进入仓库，只能由维护者安全备份并配置为 GitHub Actions Secret。正式构建前还必须按 [更新文档](docs/updater.md) 配置平台签名和公证 Secrets。版本与发版命令见 [版本规范](docs/versioning.md)，发布说明见 [release-notes.md](docs/release-notes.md)。
+若正在显示、采集、录制或转换 WAV，程序会要求先安全停止；HDF5、WAV、同名 JSON 与 `manifest.jsonl` 全部关闭后，才启动独立更新助手。安装目录与记录目录相互独立，更新逻辑不会遍历、覆盖或删除 `~/Documents/AcousticVectorRecords`、用户选择的其他数据目录或每用户配置目录。
+
+源码中的 `updater/public_key.pem` 是客户端更新信任根；匹配的私钥绝不能进入仓库，只能由维护者安全备份并配置为 GitHub Actions Secret。Apple Developer ID/公证与 Windows Authenticode 是可选但推荐的独立能力：一组 Secrets 全部未配置时，CI 会生成文件名明确带 `unsigned` 的内部测试包；只配置一部分会失败，避免错误标记。详情见 [更新文档](docs/updater.md)，版本与发版命令见 [版本规范](docs/versioning.md)，发布说明见 [release-notes.md](docs/release-notes.md)。
 
 ## 开发检查
 

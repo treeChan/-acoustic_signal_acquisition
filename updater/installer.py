@@ -65,6 +65,7 @@ def build_install_plan(
     expected_sha256: str,
     *,
     platform_key: str,
+    system_signature: str,
     executable: Path | None = None,
     parent_pid: int | None = None,
     status_file: Path | None = None,
@@ -79,6 +80,15 @@ def build_install_plan(
     # directory and the application installation directory.
     status = status_file.resolve() if status_file is not None else _status_file()
     status.parent.mkdir(parents=True, exist_ok=True)
+    allowed_system_signatures = {
+        "macos-arm64": {"apple-developer-id", "unsigned"},
+        "windows-x64": {"windows-authenticode", "unsigned"},
+    }
+    if system_signature not in allowed_system_signatures.get(platform_key, set()):
+        raise UpdateError(
+            "installer_package",
+            f"当前平台的系统签名状态无效：{system_signature}。",
+        )
     common = (
         *helper,
         "--platform",
@@ -89,6 +99,8 @@ def build_install_plan(
         str(pid),
         "--sha256",
         expected_sha256.lower(),
+        "--system-signature",
+        system_signature,
         "--status-file",
         str(status),
     )
@@ -102,7 +114,7 @@ def build_install_plan(
                 "请使用有权限的账户安装，或先把应用移到当前用户可写的 Applications 目录。",
             )
         if package.suffix.lower() != ".zip":
-            raise UpdateError("installer_package", "macOS 自动更新包必须是签名、公证后的 ZIP。")
+            raise UpdateError("installer_package", "macOS 自动更新包必须是 ZIP。")
         command = (*common, "--target", str(target), "--relaunch")
         return InstallPlan(command, target, status)
     if platform_key == "windows-x64":

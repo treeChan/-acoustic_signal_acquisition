@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -16,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from updater.models import decode_manifest, parse_manifest  # noqa: E402
-from updater.verifier import verify_manifest_signature  # noqa: E402
+from updater.verifier import verify_artifact_signature, verify_manifest_signature  # noqa: E402
 
 
 def request(session: requests.Session, method: str, url: str, **kwargs: object) -> requests.Response:
@@ -66,6 +67,9 @@ def main() -> int:
         raise SystemExit("Manifest does not contain exactly macos-arm64 and windows-x64")
     for platform_key, artifact in manifest.platforms.items():
         asset_name = Path(unquote(urlsplit(artifact.url).path)).name
+        asset_name_is_unsigned = "-unsigned" in Path(asset_name).stem
+        if asset_name_is_unsigned != (artifact.system_signature == "unsigned"):
+            raise SystemExit(f"Asset filename/signature label mismatch for {platform_key}")
         required_assets = {asset_name, f"{asset_name}.sha256", f"{asset_name}.sig"}
         missing_assets = sorted(required_assets - assets.keys())
         if missing_assets:
@@ -76,6 +80,21 @@ def main() -> int:
         content_length = head.headers.get("Content-Length")
         if content_length and int(content_length) != artifact.size:
             raise SystemExit(f"Remote size mismatch for {platform_key}")
+        response = request(session, "GET", artifact.url, stream=True)
+        digest = hashlib.sha256()
+        downloaded = 0
+        try:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    downloaded += len(chunk)
+                    digest.update(chunk)
+        finally:
+            response.close()
+        if downloaded != artifact.size:
+            raise SystemExit(f"Downloaded size mismatch for {platform_key}")
+        if digest.hexdigest().lower() != artifact.sha256.lower():
+            raise SystemExit(f"Downloaded SHA-256 mismatch for {platform_key}")
+        verify_artifact_signature(manifest.version, platform_key, artifact, public_key)
     if not preview and release.get("prerelease"):
         raise SystemExit("Stable Release must not be a prerelease")
     print(f"Verified release {args.tag}: update.json and both platform assets are accessible")
