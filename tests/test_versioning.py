@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 
+from scripts.sync_version import numeric_version
 from updater.errors import UpdateError
 from updater.versioning import is_newer, parse_project_version, preview_version
 
@@ -33,3 +35,14 @@ def test_comparison_uses_packaging_semantics() -> None:
 
 def test_preview_timestamp_has_no_month_leading_zero() -> None:
     assert preview_version("1.4.0", datetime(2026, 9, 5, 7, 3)) == "1.4.0-preview.9050703"
+
+
+def test_windows_installer_uses_numeric_file_version_for_preview() -> None:
+    assert numeric_version("0.2.0-preview.9152209") == (0, 2, 0, 0)
+    installer = (
+        Path(__file__).resolve().parents[1]
+        / "installer"
+        / "windows"
+        / "AcousticVectorAcquisition.iss"
+    ).read_text(encoding="utf-8")
+    assert "VersionInfoProductVersion={#MyNumericVersion}" in installer
