@@ -3,3 +3,6 @@ h5py>=3.8
 pyserial>=3.5
 PyQt5>=5.15
 pyqtgraph>=0.13
+packaging>=23.2
+requests>=2.31
+cryptography>=42

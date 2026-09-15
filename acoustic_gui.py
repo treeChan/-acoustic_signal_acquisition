@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -29,6 +30,10 @@ from acoustic_acquisition import (
     export_h5_data_to_pcm_wav,
     pcm_full_scale_voltage,
 )
+from updater import CURRENT_VERSION
+from updater.checker import UpdateCheckResult
+from updater.downloader import DownloadResult
+from updater.qt_ui import UpdateManager
 
 
 CHANNELS = 4
@@ -50,6 +55,7 @@ class AcquisitionWorker(QtCore.QObject):
     recording_finalizing = QtCore.pyqtSignal(str, int)
     recording_completed = QtCore.pyqtSignal(str, str, int)
     recording_export_failed = QtCore.pyqtSignal(str)
+    shutdown_validation_failed = QtCore.pyqtSignal(str)
     failed = QtCore.pyqtSignal(str)
     finished = QtCore.pyqtSignal()
 
@@ -61,6 +67,7 @@ class AcquisitionWorker(QtCore.QObject):
         self._record_lock = threading.Lock()
         self._record_busy = threading.Event()
         self._conversion_thread: threading.Thread | None = None
+        self._conversion_error: str | None = None
         self._record_request: tuple[Path, float, float, float, float, str, int] | None = None
 
     def request_stop(self) -> None:
@@ -79,6 +86,7 @@ class AcquisitionWorker(QtCore.QObject):
                 output_dir, duration, sensitivity, azimuth_deg, elevation_deg,
                 note.strip(), wav_bit_depth,
             )
+            self._conversion_error = None
             self._record_busy.set()
             self._record_stop.clear()
             return True
@@ -155,11 +163,19 @@ class AcquisitionWorker(QtCore.QObject):
                 "duration_seconds": finished_samples / SAMPLE_RATE,
             }
             json_path = finished_h5_path.with_suffix(".json")
-            json_path.write_text(
-                json.dumps(sidecar, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
+            json_part = json_path.with_name(json_path.name + ".part")
+            try:
+                with json_part.open("w", encoding="utf-8") as sidecar_file:
+                    sidecar_file.write(json.dumps(sidecar, ensure_ascii=False, indent=2) + "\n")
+                    sidecar_file.flush()
+                    os.fsync(sidecar_file.fileno())
+                os.replace(json_part, json_path)
+            finally:
+                json_part.unlink(missing_ok=True)
             with (finished_h5_path.parent / "manifest.jsonl").open("a", encoding="utf-8") as manifest:
                 manifest.write(json.dumps(sidecar, ensure_ascii=False) + "\n")
+                manifest.flush()
+                os.fsync(manifest.fileno())
             self._record_busy.clear()
             self.recording_completed.emit(
                 str(finished_h5_path.resolve()), str(finished_wav_path.resolve()), finished_samples
@@ -187,6 +203,7 @@ class AcquisitionWorker(QtCore.QObject):
                 record_metadata["wav_full_scale_voltage_v"] = full_scale_voltage
             if wav is not None:
                 wav.close()
+            h5.flush()
             h5.close()
             finished_h5_path = h5_path
             finished_wav_path = wav_path
@@ -219,10 +236,12 @@ class AcquisitionWorker(QtCore.QObject):
                         finished_metadata, completed_at,
                     )
                 except Exception as exc:
-                    self._record_busy.clear()
-                    self.recording_export_failed.emit(
-                        f"生成 {wav_bit_depth}-bit PCM WAV 失败：{type(exc).__name__}: {exc}；HDF5 已保留"
+                    self._conversion_error = (
+                        f"生成 {wav_bit_depth}-bit PCM WAV 失败："
+                        f"{type(exc).__name__}: {exc}；HDF5 已保留"
                     )
+                    self._record_busy.clear()
+                    self.recording_export_failed.emit(self._conversion_error)
 
             self._conversion_thread = threading.Thread(
                 target=export_pcm, name="pcm-wav-export", daemon=False
@@ -324,6 +343,10 @@ class AcquisitionWorker(QtCore.QObject):
                 self.failed.emit(f"关闭录制文件失败：{exc}")
             if self._conversion_thread is not None:
                 self._conversion_thread.join()
+            if self._conversion_error:
+                # Emitted from the acquisition QThread immediately before
+                # finished, so an updater can never race past a failed writer.
+                self.shutdown_validation_failed.emit(self._conversion_error)
             if serial_port is not None:
                 try:
                     serial_port.write(USB_STOP_COMMAND)
@@ -338,7 +361,7 @@ class AcquisitionWorker(QtCore.QObject):
 class AcousticMainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("声学矢量信号采集系统 · PXYZ")
+        self.setWindowTitle(f"声学矢量信号采集系统 · PXYZ · v{CURRENT_VERSION}")
         self.resize(1480, 900)
         self.thread: QtCore.QThread | None = None
         self.worker: AcquisitionWorker | None = None
@@ -352,11 +375,33 @@ class AcousticMainWindow(QtWidgets.QMainWindow):
         self.tf_history: deque[tuple[float, np.ndarray]] = deque()
         self.tf_fft_size = 0
         self.tf_last_sample_count = 0
+        self._pending_update: tuple[DownloadResult, UpdateCheckResult] | None = None
+        self._safe_shutdown_error: str | None = None
         self._build_ui()
+        self.update_manager = UpdateManager(self)
+        self._build_menus()
         self.refresh_ports()
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.update_display)
         self.timer.start(150)
+        QtCore.QTimer.singleShot(5000, lambda: self.update_manager.check(silent=True))
+
+    def _build_menus(self) -> None:
+        help_menu = self.menuBar().addMenu("帮助")
+        check_action = help_menu.addAction("检查更新…")
+        check_action.triggered.connect(lambda: self.update_manager.check(silent=False))
+        self.update_manager.set_action(check_action)
+        help_menu.addSeparator()
+        about_action = help_menu.addAction("关于")
+        about_action.triggered.connect(self.show_about)
+
+    def show_about(self) -> None:
+        channel = "预览" if "-preview." in CURRENT_VERSION else "正式"
+        QtWidgets.QMessageBox.about(
+            self,
+            "关于声学矢量信号采集系统",
+            f"声学矢量信号采集系统\n版本 {CURRENT_VERSION}\n更新渠道：{channel}",
+        )
 
     def _build_ui(self) -> None:
         root = QtWidgets.QWidget()
@@ -690,6 +735,7 @@ class AcousticMainWindow(QtWidgets.QMainWindow):
         self.worker.recording_finalizing.connect(self.on_recording_finalizing)
         self.worker.recording_completed.connect(self.on_recording_completed)
         self.worker.recording_export_failed.connect(self.on_recording_export_failed)
+        self.worker.shutdown_validation_failed.connect(self.on_shutdown_validation_failed)
         self.worker.failed.connect(self.on_failed)
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
@@ -899,6 +945,8 @@ class AcousticMainWindow(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot(str)
     def on_recording_export_failed(self, message: str) -> None:
+        if self._pending_update is not None:
+            self._safe_shutdown_error = message
         self.is_recording = False
         self.is_finalizing = False
         self.record_button.setEnabled(self.worker is not None)
@@ -910,9 +958,17 @@ class AcousticMainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.critical(self, "WAV 保存失败", message)
 
     @QtCore.pyqtSlot(str)
+    def on_shutdown_validation_failed(self, message: str) -> None:
+        if self._pending_update is not None:
+            self._safe_shutdown_error = message
+
+    @QtCore.pyqtSlot(str)
     def on_failed(self, message: str) -> None:
+        if self._pending_update is not None:
+            self._safe_shutdown_error = message
         self.status_label.setText(f"采集失败：{message}")
-        QtWidgets.QMessageBox.critical(self, "采集失败", message)
+        if self._pending_update is None:
+            QtWidgets.QMessageBox.critical(self, "采集失败", message)
 
     def on_thread_finished(self) -> None:
         if self.thread:
@@ -929,6 +985,60 @@ class AcousticMainWindow(QtWidgets.QMainWindow):
         self.port_combo.setEnabled(True)
         self.state_badge.setText("● 设备已连接")
         self.state_badge.setStyleSheet("color: #3fb950; font-weight: 700;")
+        if self._pending_update is not None:
+            pending = self._pending_update
+            self._pending_update = None
+            if self._safe_shutdown_error:
+                pending[0].cleanup()
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "更新已取消",
+                    "采集或文件关闭过程中发生错误，为保护数据，本次更新没有安装。\n\n"
+                    + self._safe_shutdown_error,
+                )
+            else:
+                self.status_label.setText("采集数据已安全保存，正在启动外部更新程序…")
+                QtCore.QTimer.singleShot(
+                    0, lambda: self.update_manager.install_verified(pending[0], pending[1])
+                )
+            self._safe_shutdown_error = None
+
+    def prepare_for_update_install(
+        self, result: DownloadResult, check: UpdateCheckResult
+    ) -> None:
+        """Do not launch an installer until acquisition and every writer are closed."""
+        busy = bool(self.thread and self.thread.isRunning()) or self.is_recording or self.is_finalizing
+        if not busy:
+            self.update_manager.install_verified(result, check)
+            return
+        warning = QtWidgets.QMessageBox(self)
+        warning.setIcon(QtWidgets.QMessageBox.Warning)
+        warning.setWindowTitle("必须先安全停止采集")
+        warning.setText(
+            "当前正在显示、录制或封装 WAV。立即安装会损坏正在写入的数据。\n\n"
+            "选择“安全停止并更新”后，程序会先停止采集，flush/close HDF5 和 WAV，"
+            "写完 JSON 与 manifest，再退出并启动外部安装程序。"
+        )
+        stop_and_update = warning.addButton("安全停止并更新", QtWidgets.QMessageBox.AcceptRole)
+        warning.addButton("稍后更新", QtWidgets.QMessageBox.RejectRole)
+        warning.exec_()
+        if warning.clickedButton() is not stop_and_update:
+            result.cleanup()
+            return
+        self._pending_update = (result, check)
+        self._safe_shutdown_error = None
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(False)
+        self.record_button.setEnabled(False)
+        self.stop_record_button.setEnabled(False)
+        self.status_label.setText(
+            "正在安全停止采集并保存 HDF5/WAV/JSON/manifest，完成后才会安装更新…"
+        )
+        if self.worker:
+            self.worker.request_stop()
+        else:
+            self._pending_update = None
+            self.update_manager.install_verified(result, check)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         if self.worker and self.thread and self.thread.isRunning():
@@ -943,9 +1053,12 @@ class AcousticMainWindow(QtWidgets.QMainWindow):
 def main() -> int:
     app = QtWidgets.QApplication([])
     app.setApplicationName("声学矢量信号采集系统")
+    app.setApplicationVersion(CURRENT_VERSION)
     app.setStyle("Fusion")
     window = AcousticMainWindow()
     window.show()
+    if "--smoke-test" in sys.argv:
+        QtCore.QTimer.singleShot(1500, app.quit)
     return app.exec_()
 
 

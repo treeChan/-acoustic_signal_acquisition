@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import queue
 import signal
@@ -67,6 +68,8 @@ class Float32WavWriter:
         self._file.write(struct.pack("<I", 36 + self.data_bytes))
         self._file.seek(40)
         self._file.write(struct.pack("<I", self.data_bytes))
+        self._file.flush()
+        os.fsync(self._file.fileno())
         self._file.close()
 
     def __enter__(self) -> "Float32WavWriter":
@@ -123,6 +126,8 @@ class PcmWavWriter:
         self._file.write(struct.pack("<I", 36 + self.data_bytes))
         self._file.seek(40)
         self._file.write(struct.pack("<I", self.data_bytes))
+        self._file.flush()
+        os.fsync(self._file.fileno())
         self._file.close()
 
     def __enter__(self) -> "PcmWavWriter":

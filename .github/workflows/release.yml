@@ -1,0 +1,282 @@
+name: Build and publish signed update
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - preview
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: acoustic-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      channel: ${{ steps.version.outputs.channel }}
+      tag: ${{ steps.version.outputs.tag }}
+      numeric_version: ${{ steps.version.outputs.numeric_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install packaging
+      - id: version
+        name: Read VERSION
+        shell: bash
+        run: python scripts/sync_version.py --github-output "$GITHUB_OUTPUT"
+      - name: Require the matching release tag
+        shell: bash
+        env:
+          EXPECTED_TAG: ${{ steps.version.outputs.tag }}
+          ACTUAL_TAG: ${{ github.ref_name }}
+        run: python -c "import os,sys; sys.exit(0 if os.environ['EXPECTED_TAG'] == os.environ['ACTUAL_TAG'] else 'Tag does not match VERSION')"
+
+  test:
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+      - run: python -m compileall -q acoustic_acquisition.py acoustic_gui.py updater scripts tests
+
+  build-macos-arm64:
+    needs: [metadata, test]
+    runs-on: macos-14
+    env:
+      ACOUSTIC_VERSION: ${{ needs.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Require release secrets
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          for name in MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+            test -n "${!name}" || { echo "Missing required secret: $name"; exit 1; }
+          done
+      - name: Install build dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Build external updater and application
+        shell: bash
+        run: |
+          python -m PyInstaller --noconfirm --clean --distpath helper-dist --workpath build/helper packaging/acoustic_updater_helper.spec
+          export ACOUSTIC_HELPER_PATH="$PWD/helper-dist/AcousticUpdater"
+          python -m PyInstaller --noconfirm --clean --distpath dist --workpath build/app packaging/acoustic_gui.spec
+      - name: Import Apple signing certificate
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          python -c "import base64,os,pathlib; pathlib.Path(os.environ['RUNNER_TEMP'],'certificate.p12').write_bytes(base64.b64decode(os.environ['MACOS_CERTIFICATE_P12_BASE64']))"
+          KEYCHAIN_PATH="$RUNNER_TEMP/acoustic-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/certificate.p12" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+      - name: Sign, notarize and staple
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          APP_PATH="$PWD/dist/AcousticVectorAcquisition.app"
+          codesign --force --deep --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$RUNNER_TEMP/notarization.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarization.zip" --apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple "$APP_PATH"
+          xcrun stapler validate "$APP_PATH"
+          spctl --assess --type execute --verbose=2 "$APP_PATH"
+      - name: Pack and smoke test
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          QT_QPA_PLATFORM=offscreen dist/AcousticVectorAcquisition.app/Contents/MacOS/AcousticVectorAcquisition --smoke-test
+          PLIST_VERSION="$(defaults read "$PWD/dist/AcousticVectorAcquisition.app/Contents/Info" AcousticFullVersion)"
+          test "$PLIST_VERSION" = "$ACOUSTIC_VERSION"
+          ditto -c -k --sequesterRsrc --keepParent dist/AcousticVectorAcquisition.app "release-assets/AcousticVectorAcquisition-${ACOUSTIC_VERSION}-macos-arm64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64-release
+          path: release-assets/*
+          if-no-files-found: error
+
+  build-windows-x64:
+    needs: [metadata, test]
+    runs-on: windows-2022
+    env:
+      ACOUSTIC_VERSION: ${{ needs.metadata.outputs.version }}
+      ACOUSTIC_NUMERIC_VERSION: ${{ needs.metadata.outputs.numeric_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Require release secrets
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          @('WINDOWS_CERTIFICATE_PFX_BASE64','WINDOWS_CERTIFICATE_PASSWORD') | ForEach-Object {
+            if ([string]::IsNullOrWhiteSpace((Get-Item "env:$_").Value)) { throw "Missing required secret: $_" }
+          }
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements-dev.txt
+          choco install innosetup --yes --no-progress
+      - name: Build external updater and application
+        shell: pwsh
+        run: |
+          python scripts/sync_version.py --windows-version-file build/version_info.txt
+          python -m PyInstaller --noconfirm --clean --distpath helper-dist --workpath build/helper packaging/acoustic_updater_helper.spec
+          $env:ACOUSTIC_HELPER_PATH = (Resolve-Path "helper-dist\AcousticUpdater.exe")
+          $env:ACOUSTIC_WINDOWS_VERSION_FILE = (Resolve-Path "build\version_info.txt")
+          python -m PyInstaller --noconfirm --clean --distpath dist --workpath build/app packaging/acoustic_gui.spec
+      - name: Authenticode-sign application files
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\windows-code-signing.pfx", [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX_BASE64))
+          $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe | Where-Object FullName -Match '\\x64\\' | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          if (-not $signtool) { throw "signtool.exe not found" }
+          Get-ChildItem dist\AcousticVectorAcquisition -Recurse -Filter *.exe | ForEach-Object {
+            & $signtool sign /fd SHA256 /td SHA256 /tr https://timestamp.digicert.com /f "$env:RUNNER_TEMP\windows-code-signing.pfx" /p $env:WINDOWS_CERTIFICATE_PASSWORD $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed for $($_.Name)" }
+          }
+      - name: Smoke test and build installer
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath "dist\AcousticVectorAcquisition\AcousticVectorAcquisition.exe" -ArgumentList "--smoke-test" -PassThru
+          if (-not $process.WaitForExit(15000)) { $process.Kill(); throw "Packaged GUI smoke test timed out" }
+          if ($process.ExitCode -ne 0) { throw "Packaged GUI smoke test failed" }
+          $env:ACOUSTIC_WINDOWS_DIST = (Resolve-Path "dist\AcousticVectorAcquisition")
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer\windows\AcousticVectorAcquisition.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
+      - name: Sign installer
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $signtool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe | Where-Object FullName -Match '\\x64\\' | Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          Get-ChildItem release-assets -Filter *.exe | ForEach-Object {
+            & $signtool sign /fd SHA256 /td SHA256 /tr https://timestamp.digicert.com /f "$env:RUNNER_TEMP\windows-code-signing.pfx" /p $env:WINDOWS_CERTIFICATE_PASSWORD $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Installer signing failed" }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-release
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish-and-verify:
+    needs: [metadata, build-macos-arm64, build-windows-x64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.metadata.outputs.version }}
+      CHANNEL: ${{ needs.metadata.outputs.channel }}
+      TAG: ${{ needs.metadata.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install cryptography packaging requests
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-release"
+          path: release-assets
+          merge-multiple: true
+      - name: Create signed update manifest
+        shell: bash
+        env:
+          RELEASE_PRIVATE_KEY: ${{ secrets.UPDATE_ED25519_PRIVATE_KEY }}
+        run: |
+          python -c "import os,pathlib; pathlib.Path(os.environ['RUNNER_TEMP'],'release-key').write_text(os.environ['RELEASE_PRIVATE_KEY'],encoding='utf-8')"
+          python scripts/verify_release_key.py --private-key "$RUNNER_TEMP/release-key" --public-key updater/public_key.pem
+          MAC_ASSET="release-assets/AcousticVectorAcquisition-${VERSION}-macos-arm64.zip"
+          WIN_ASSET="release-assets/AcousticVectorAcquisition-${VERSION}-windows-x64-setup.exe"
+          test -f "$MAC_ASSET"
+          test -f "$WIN_ASSET"
+          python scripts/make_update_manifest.py \
+            --private-key "$RUNNER_TEMP/release-key" \
+            --notes docs/release-notes.md \
+            --base-download-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}" \
+            --artifact "macos-arm64=${MAC_ASSET}" \
+            --artifact "windows-x64=${WIN_ASSET}" \
+            --metadata-dir release-assets \
+            --output release-assets/update.json
+      - name: Publish GitHub Release with every required asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$CHANNEL" == "stable" ]]; then
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              echo "Release $TAG already exists; refusing to overwrite it"
+              exit 1
+            fi
+            gh release create "$TAG" release-assets/* --verify-tag --title "Acoustic Vector Acquisition ${VERSION}" --notes-file docs/release-notes.md --latest
+          else
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release upload "$TAG" release-assets/* --clobber
+              gh release edit "$TAG" --title "Acoustic Vector Acquisition ${VERSION}" --notes-file docs/release-notes.md --prerelease --latest=false
+            else
+              gh release create "$TAG" release-assets/* --verify-tag --title "Acoustic Vector Acquisition ${VERSION}" --notes-file docs/release-notes.md --prerelease --latest=false
+            fi
+          fi
+      - name: Verify published Release and downloadable update chain
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/validate_release.py --repository "$GITHUB_REPOSITORY" --tag "$TAG"

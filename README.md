@@ -30,6 +30,25 @@ bash run_gui_macos.command
 
 打包版应用的默认保存目录是 `~/Documents/AcousticVectorRecords`，可在界面中改为任意可写目录。
 
+## 在线更新
+
+“帮助 → 检查更新…”可手动检查，程序启动 5 秒后也会在后台静默检查。正式版只读取正式渠道，预览版只读取 `preview` 渠道。发现新版本后会显示当前/最新版本与经过安全处理的 Markdown 更新说明；下载窗口显示进度、大小、速度、预计剩余时间并可取消。
+
+客户端只有在更新清单 Ed25519 签名、安装包 SHA-256 和安装包描述签名全部通过后才会进入安装。若正在显示、采集、录制或转换 WAV，程序会要求先安全停止；HDF5、WAV、同名 JSON 与 `manifest.jsonl` 全部关闭后，才启动独立更新助手。安装目录与记录目录相互独立，更新逻辑不会遍历、覆盖或删除 `~/Documents/AcousticVectorRecords` 或用户选择的其他数据目录。
+
+源码中的 `updater/public_key.pem` 是客户端更新信任根；匹配的私钥绝不能进入仓库，只能由维护者安全备份并配置为 GitHub Actions Secret。正式构建前还必须按 [更新文档](docs/updater.md) 配置平台签名和公证 Secrets。版本与发版命令见 [版本规范](docs/versioning.md)，发布说明见 [release-notes.md](docs/release-notes.md)。
+
+## 开发检查
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+python3 scripts/sync_version.py
+python3 -m compileall -q acoustic_acquisition.py acoustic_gui.py updater scripts tests
+QT_QPA_PLATFORM=offscreen python3 -m pytest -q
+```
+
+网络测试只绑定临时 `127.0.0.1` 端口，安装测试使用安全测试模式，不会覆盖真实应用或采集数据。
+
 ## 接线
 
 四通道 `USP_3D` 接线和数据列固定如下：

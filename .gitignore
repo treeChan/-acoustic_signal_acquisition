@@ -12,7 +12,17 @@ venv/
 # Build outputs
 build/
 dist/
+helper-dist/
+release-assets/
 *.spec
+!packaging/*.spec
+.pytest_cache/
+
+# Release credentials must never enter git
+*.p12
+*.pfx
+*private*key*.pem
+release-key*
 
 # Local acquisition data and generated test outputs
 records/
