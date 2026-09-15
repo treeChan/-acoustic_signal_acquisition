@@ -27,14 +27,7 @@ def request(session: requests.Session, method: str, url: str, **kwargs: object) 
     return response
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--repository", required=True)
-    parser.add_argument("--tag", required=True)
-    args = parser.parse_args()
-    token = os.environ.get("GH_TOKEN")
-    if not token:
-        raise SystemExit("GH_TOKEN is required")
+def api_session(token: str) -> requests.Session:
     session = requests.Session()
     session.headers.update(
         {
@@ -44,8 +37,33 @@ def main() -> int:
             "User-Agent": "AcousticVectorReleaseVerifier/1",
         }
     )
+    return session
+
+
+def public_download_session() -> requests.Session:
+    """Use the same anonymous path that an installed public client will use.
+
+    GitHub API credentials are deliberately excluded: browser download URLs may
+    redirect to a separate asset host, and an API bearer token must not follow
+    those redirects.
+    """
+    session = requests.Session()
+    session.headers.update({"User-Agent": "AcousticVectorReleaseVerifier/1"})
+    return session
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repository", required=True)
+    parser.add_argument("--tag", required=True)
+    args = parser.parse_args()
+    token = os.environ.get("GH_TOKEN")
+    if not token:
+        raise SystemExit("GH_TOKEN is required")
+    github_api = api_session(token)
+    public_downloads = public_download_session()
     release_url = f"https://api.github.com/repos/{args.repository}/releases/tags/{args.tag}"
-    release = request(session, "GET", release_url).json()
+    release = request(github_api, "GET", release_url).json()
     version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     preview = "-preview." in version
     if release.get("draft"):
@@ -55,7 +73,9 @@ def main() -> int:
     assets = {item["name"]: item for item in release.get("assets", [])}
     if "update.json" not in assets:
         raise SystemExit("Release asset update.json is missing")
-    manifest_response = request(session, "GET", assets["update.json"]["browser_download_url"])
+    manifest_response = request(
+        public_downloads, "GET", assets["update.json"]["browser_download_url"]
+    )
     raw = decode_manifest(manifest_response.content)
     public_key = (ROOT / "updater" / "public_key.pem").read_bytes()
     verify_manifest_signature(raw, public_key)
@@ -76,11 +96,11 @@ def main() -> int:
             raise SystemExit(
                 f"Manifest {platform_key} assets are absent from Release: {', '.join(missing_assets)}"
             )
-        head = request(session, "HEAD", artifact.url)
+        head = request(public_downloads, "HEAD", artifact.url)
         content_length = head.headers.get("Content-Length")
         if content_length and int(content_length) != artifact.size:
             raise SystemExit(f"Remote size mismatch for {platform_key}")
-        response = request(session, "GET", artifact.url, stream=True)
+        response = request(public_downloads, "GET", artifact.url, stream=True)
         digest = hashlib.sha256()
         downloaded = 0
         try:
